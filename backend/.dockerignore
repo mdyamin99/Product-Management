@@ -1,0 +1,13 @@
+# Host dependencies must never shadow the ones `npm ci` installs in the
+# image — a Windows `node_modules` would otherwise be copied over the Linux
+# install and break the native binaries.
+node_modules
+dist
+
+# Secrets stay out of the image: every value comes from compose `environment`.
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+.DS_Store
