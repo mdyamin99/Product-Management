@@ -1,0 +1,18 @@
+
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # Metrics exposed by the OTel collector's prometheus exporter.
+  # honor_labels: true keeps the collector-provided `job` label (the OTel
+  # service.name, e.g. product-management-backend) instead of letting
+  # Prometheus override it and rename it to `exported_job`.
+  - job_name: otel-collector
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:9464"]
+
+  # Prometheus' own metrics for self-monitoring.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
