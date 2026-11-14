@@ -1,0 +1,238 @@
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: productdb
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d productdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.8.1
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    ports:
+      - "9094:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    restart: unless-stopped
+    environment:
+      KAFKA_CLUSTERS_0_NAME: product-management
+      # Inside the compose network the broker is reachable as "kafka".
+      # The localhost:9094 advertised listener only works from the host.
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Local SMTP sink with a web UI: every e-mail the backend sends (welcome,
+  # welcome-back, password reset) shows up at http://localhost:8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      NODE_ENV: development
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/productdb?schema=public"
+      REDIS_URL: "redis://redis:6379"
+      FRONTEND_URL: "http://localhost:5173"
+      CACHE_TTL_SECONDS: 60
+
+      # --- Authentication ---------------------------------------------------
+      # Development-only secrets; override for any real deployment.
+      JWT_ACCESS_SECRET: "compose-dev-access-secret-change-me-0000000000"
+      JWT_REFRESH_SECRET: "compose-dev-refresh-secret-change-me-000000000"
+      JWT_ACCESS_TTL_SECONDS: 900
+      JWT_REFRESH_TTL_SECONDS: 604800
+      COOKIE_SECURE: "false"
+      LOGIN_RATE_LIMIT: 10
+      REGISTER_RATE_LIMIT: 5
+      RATE_LIMIT_WINDOW_SECONDS: 300
+
+      # --- E-mail (Nodemailer) ----------------------------------------------
+      # Overridden by the .env file next to compose.yaml: the defaults land
+      # every message in Mailpit (http://localhost:8025), and filling in
+      # SMTP_USER/SMTP_PASS there switches delivery to Gmail.
+      SMTP_HOST: "${SMTP_HOST:-mailpit}"
+      SMTP_PORT: "${SMTP_PORT:-1025}"
+      SMTP_SECURE: "${SMTP_SECURE:-false}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASS: "${SMTP_PASS:-}"
+      MAIL_FROM: "${MAIL_FROM:-Product Monitor <no-reply@product-monitor.local>}"
+
+      # --- Messaging --------------------------------------------------------
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "product.events"
+      KAFKA_CONSUMER_GROUP: "product-management-events"
+      KAFKA_AUTH_TOPIC: "auth.events"
+      KAFKA_AUTH_CONSUMER_GROUP: "product-management-auth"
+
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672"
+      RABBITMQ_EXCHANGE: "product.events"
+      RABBITMQ_QUEUE: "product.notifications"
+      RABBITMQ_AUTH_EXCHANGE: "auth.events"
+      RABBITMQ_AUTH_QUEUE: "auth.notifications"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://otel-collector:4318/v1/traces"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://otel-collector:4318/v1/metrics"
+      OTEL_SERVICE_NAME: "product-management-backend"
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+        
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Jaeger's query service traces its own UI/API requests by default,
+      # which shows up as noise in the UI. Disable self-tracing.
+      QUERY_ENABLE_TRACING: "false"
+    ports:
+      - "16686:16686"
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.164.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "9464:9464"
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-remote-write-receiver"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - ./observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+      - jaeger
+    restart: unless-stopped
+
+  loadtest:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    depends_on:
+      backend:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    environment:
+      # Inside the compose network the backend is reachable by service name.
+      K6_BASE_URL: "http://backend:3000"
+      # Stream k6 metrics into Prometheus so they show up in Grafana.
+      K6_PROMETHEUS_RW_SERVER_URL: "http://prometheus:9090"
+      K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM: "true"
+      K6_OUT: "experimental-prometheus-rw"
+    volumes:
+      - ./loadtest/k6:/scripts:ro
+    command: ["run", "/scripts/products.js"]
+
+volumes:
+  postgres_data:
+  grafana-data:
+  
